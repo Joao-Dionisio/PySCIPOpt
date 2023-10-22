@@ -67,7 +67,7 @@ def test_create_solution():
     with pytest.raises(ValueError):
         scip.Solution()
 
-def test_print_soltion():
+def test_print_solution():
     m = Model()
 
     m.addVar()
