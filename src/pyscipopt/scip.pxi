@@ -2386,6 +2386,22 @@ cdef class Model:
         """
         PY_SCIP_CALL(SCIPaddCoefLinear(self._scip, cons.scip_cons, var.scip_var, coeff))
 
+    def addExprNonlinear(self, Constraint cons, Expr expr, float coeff):
+        """Add coef*expr to nonlinear constraint.
+        
+        :param Constraint cons: nonlinear constraint to be changed
+        :param Expr expr: scip expression to be added
+        :param float coeff: coefficient of new expression"""
+        
+        cdef Constraint new_term
+        cdef Expr _expr
+
+        new_term = self.createCons(expr <= float("inf"))
+        _expr = new_term.expr
+
+        SCIPaddExprNonlinear(self._scip, cons.scip_cons, _expr, coeff)
+        return cons
+
     def addConsNode(self, Node node, Constraint cons, Node validnode=None):
         """Add a constraint to the given node
 
