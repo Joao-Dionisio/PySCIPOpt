@@ -286,9 +286,14 @@ def test_quad_coeffs():
     assert linterms[0][0].name == z.name
     assert linterms[0][1] == 4
 
-if __name__ == "__main__":
-    test_string_poly()
-    test_string()
-    test_circle()
-    test_gastrans()
-    test_quad_coeffs()
+def test_addExprNonLinear():
+    model = Model()
+    x = {}
+    for i in range(10):
+        x[i] = model.addVar(ub = i)
+    
+    c = model.addCons(quicksum((x[i]/(i+1))**i for i in range(5)) >= 100)
+    model.addExprNonlinear(c, quicksum(-x[i]**i for i in range(6,10)), 10)
+
+    model.setObjective(quicksum(x[i]*i for i in range(10)))
+    model.optimize()

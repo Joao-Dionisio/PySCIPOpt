@@ -2394,10 +2394,10 @@ cdef class Model:
         :param float coeff: coefficient of new expression"""
         
         cdef Constraint new_term
-        cdef Expr _expr
+        cdef SCIP_EXPR* _expr
 
         new_term = self.createCons(expr <= float("inf"))
-        _expr = new_term.expr
+        _expr = SCIPgetExprNonlinear(new_term.scip_cons)
 
         SCIPaddExprNonlinear(self._scip, cons.scip_cons, _expr, coeff)
         return cons
