@@ -131,3 +131,6 @@ model.lp
 # VSCode
 .vscode/
 .devcontainer/
+
+# Testing readStatistics
+tests/data/readStatistics.stats
