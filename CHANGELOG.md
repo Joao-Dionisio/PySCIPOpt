@@ -20,6 +20,7 @@
 - Fixed stubtest failures with mypy 1.20 by marking dunder method parameters as positional-only
 - Return `MatrixGenExpr` in `buildGenExprObj` instead of `MatrixExpr`
 - Plugins now hold strong references to their `Model` instead of `weakref.proxy`, fixing `ReferenceError` during cleanup callbacks (#1193)
+- Lower macOS wheel `MACOSX_DEPLOYMENT_TARGET` to 11.0 and patch bundled SCIP/SoPlex/GCG and GCC runtime dylibs to match, fixing `delocate-wheel` failures on macos-15 runners and broadening installability for downstream consumers (e.g. pixi/uv-based environments)
 ### Changed
 - Return NotImplemented for `Expr` and `GenExpr` operators if they can't handle input types in the calculation
 - Speed up `constant * Expr` via C-level API
