@@ -13,35 +13,8 @@ RESULTS = []
 _dumps = 0
 
 
-_progress = {"total": 0, "done": 0, "start": None}
-
-
 def pytest_configure(config):
     config.addinivalue_line("markers", "timing: large benchmark compared by wall-clock time")
-
-
-def pytest_collection_finish(session):
-    _progress["total"] = len(session.items)
-    _progress["start"] = time.monotonic()
-
-
-def _minutes(seconds):
-    return f"{seconds / 60:.0f}m" if seconds >= 60 else f"{seconds:.0f}s"
-
-
-def pytest_runtest_logreport(report):
-    if report.when != "call" or not _progress["total"]:
-        return
-    _progress["done"] += 1
-    done, total = _progress["done"], _progress["total"]
-    elapsed = time.monotonic() - _progress["start"]
-    eta = elapsed / done * (total - done)
-    label = os.environ.get("BENCH_LABEL", MODE)
-    print(
-        f"\n[{label}] {done}/{total} {report.nodeid.split('::')[-1]} {report.duration:.0f}s"
-        f" · elapsed {_minutes(elapsed)} · ETA ~{_minutes(eta)}",
-        flush=True,
-    )
 
 
 def _instructions(call):
