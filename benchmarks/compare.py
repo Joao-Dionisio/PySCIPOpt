@@ -58,6 +58,11 @@ def main(base_paths, pr_paths, title):
     base, pr = load(base_paths), load(pr_paths)
     rows, regressions = [], 0
     for name in sorted(base.keys() | pr.keys()):
+        error = pr.get(name, {}).get("error")
+        if error:
+            rows.append(f"| `{name.split('::')[-1]}` | :x: {error} on PR |" + " |" * (len(METRICS) - 1))
+            regressions += 1
+            continue
         cells = []
         for _, key, kind, threshold in METRICS:
             text, worse = cell(base.get(name, {}).get(key), pr.get(name, {}).get(key), kind, threshold)
@@ -66,16 +71,13 @@ def main(base_paths, pr_paths, title):
         rows.append(f"| `{name.split('::')[-1]}` | " + " | ".join(cells) + " |")
 
     print(f"## {title}\n")
-    print(f":warning: {regressions} regression(s) flagged.\n" if regressions else "No regressions flagged.\n")
+    print(f":warning: {regressions} regression{'s' * (regressions > 1)}\n" if regressions else "No regressions\n")
     print("| Benchmark | " + " | ".join(m[0] for m in METRICS) + " |")
     print("|---|" + "---|" * len(METRICS))
     print("\n".join(rows))
     print(
-        "\nInstructions are counted with callgrind (deterministic). Time is the fastest of several calls, "
-        "only for benchmarks marked `timing`. Memory is Python-side allocations (tracemalloc), not SCIP's. "
-        "Flag thresholds: "
-        + ", ".join(f"{label.lower()} {threshold:.0%}" for label, _, _, threshold in METRICS)
-        + f"; memory changes under {MIN_BYTES // 1000} kB are never flagged."
+        "\nInstructions from callgrind, time is the best of several runs, memory is Python-side (tracemalloc). "
+        "Flagged above " + ", ".join(f"{t:.0%} {label.lower()}" for label, _, _, t in METRICS) + "."
     )
 
 
