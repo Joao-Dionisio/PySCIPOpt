@@ -541,6 +541,7 @@ def quicksum(termlist):
     '''
     result = Expr()
     for term in termlist:
+        str(type(term))
         result += term
     return result
 
