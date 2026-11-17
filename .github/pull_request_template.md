@@ -21,8 +21,7 @@
 
 - [ ] New code is covered by tests, including error paths.
 - [ ] If this touches expressions, model building or callbacks, `/benchmark` was run and shows no regression.
-  - Comment `/benchmark` on the PR to compare it against its base branch, or `/benchmark <filter>` to run a subset (pytest `-k` syntax, e.g. `/benchmark expr or plugin`). Only maintainers can trigger it.
-  - Locally: `BENCH_MODE=time pytest benchmarks` (or `BENCH_MODE=memory`).
+  `/benchmark [filter] [timelimit=seconds]`, e.g. `/benchmark expr or plugin`. Locally: `pytest benchmarks`.
 
 ### Does this PR introduce an API change? ⚠️
 
