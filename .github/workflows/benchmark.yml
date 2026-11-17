@@ -24,19 +24,30 @@ jobs:
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: ubuntu-latest
     permissions:
+      issues: write
       pull-requests: write
     outputs:
       comment_id: ${{ steps.post.outputs.comment_id }}
+      request: ${{ steps.post.outputs.request }}
     steps:
-      - name: Post status comment
+      - name: Acknowledge and post status comment
         id: post
         env:
           GH_TOKEN: ${{ github.token }}
+          COMMENT: ${{ github.event.comment.body }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+          REQUESTER: ${{ github.event.comment.user.login }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          body=":hourglass_flowing_sand: Benchmark started: building base and PR. Next update at $(date -u -d '+5 min' +%H:%M) UTC. [Live run]($RUN_URL)"
+          gh api "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" -f content=eyes > /dev/null
+          command=$(printf '%s\n' "$COMMENT" | head -n1 | tr -cd 'A-Za-z0-9_/ ' | cut -c1-80)
+          request="[\`$command\`]($COMMENT_URL) (requested by @$REQUESTER)"
+          body=":hourglass_flowing_sand: $request: installing SCIP and building wheels. Next update at $(date -u -d '+5 min' +%H:%M) UTC. [Live run]($RUN_URL)"
           id=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" -f body="$body" --jq .id)
-          echo "comment_id=$id" >> "$GITHUB_OUTPUT"
+          {
+            echo "comment_id=$id"
+            echo "request=$request"
+          } >> "$GITHUB_OUTPUT"
 
   prepare:
     if: >-
@@ -51,7 +62,8 @@ jobs:
     outputs:
       head: ${{ steps.refs.outputs.head }}
       base: ${{ steps.refs.outputs.base }}
-      matrix: ${{ steps.list.outputs.matrix }}
+      filter: ${{ steps.refs.outputs.filter }}
+      release: ${{ steps.refs.outputs.release }}
     steps:
       - name: Resolve refs and filter
         id: refs
@@ -74,49 +86,79 @@ jobs:
             echo "::error::Invalid filter: only letters, digits, '_' and spaces are allowed"
             exit 1
           fi
+          release=$(gh api repos/scipopt/PySCIPOpt/releases/latest --jq .tag_name)
           {
             echo "head=$head"
             echo "base=$base"
             echo "filter=$filter"
+            echo "release=$release"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+  build:
+    needs: prepare
+    name: "build: ${{ matrix.side }}"
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        side: [base, pr, release]
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - name: Pick source
+        id: source
+        env:
+          SIDE: ${{ matrix.side }}
+          HEAD: ${{ needs.prepare.outputs.head }}
+          BASE: ${{ needs.prepare.outputs.base }}
+          RELEASE: ${{ needs.prepare.outputs.release }}
+        run: |
+          case "$SIDE" in
+            pr) echo "repository=${{ github.repository }}" >> "$GITHUB_OUTPUT"; echo "ref=$HEAD" >> "$GITHUB_OUTPUT" ;;
+            base) echo "repository=${{ github.repository }}" >> "$GITHUB_OUTPUT"; echo "ref=$BASE" >> "$GITHUB_OUTPUT" ;;
+            release) echo "repository=scipopt/PySCIPOpt" >> "$GITHUB_OUTPUT"; echo "ref=$RELEASE" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - uses: actions/cache@v4
+        id: cache
+        if: matrix.side != 'pr'
         with:
-          ref: ${{ steps.refs.outputs.head }}
-          path: pr
-          persist-credentials: false
+          path: wheels/${{ matrix.side }}
+          key: wheel-${{ steps.source.outputs.ref }}-scip${{ env.version }}-py3.13
 
       - uses: actions/checkout@v4
+        if: steps.cache.outputs.cache-hit != 'true'
         with:
-          ref: ${{ steps.refs.outputs.base }}
-          path: base
+          repository: ${{ steps.source.outputs.repository }}
+          ref: ${{ steps.source.outputs.ref }}
+          path: src
           persist-credentials: false
 
       - name: Install SCIPOptSuite
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           wget --quiet --no-check-certificate "https://github.com/scipopt/scip/releases/download/v${version}/scipoptsuite_${version}-1+jammy_amd64.deb"
           sudo apt-get update && sudo apt install -y ./scipoptsuite_${version}-1+jammy_amd64.deb
 
       - uses: actions/setup-python@v5
+        if: steps.cache.outputs.cache-hit != 'true'
         with:
           python-version: "3.13"
 
-      - name: Build wheels
-        run: |
-          for side in base pr; do
-            python -m pip wheel --no-deps -w "wheels/$side" "./$side"
-          done
+      - name: Build wheel
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: python -m pip wheel --no-deps -w "wheels/${{ matrix.side }}" ./src
 
       - name: List benchmarks
         id: list
+        if: matrix.side == 'pr'
         env:
-          FILTER: ${{ steps.refs.outputs.filter }}
+          FILTER: ${{ needs.prepare.outputs.filter }}
         run: |
           python -m venv venv
-          venv/bin/pip install -q -r pr/requirements/benchmark.txt wheels/pr/*.whl
+          venv/bin/pip install -q -r src/requirements/benchmark.txt wheels/pr/*.whl
           select=()
           [ -n "$FILTER" ] && select=(-k "$FILTER")
-          cd pr
+          cd src
           for tier in "not timing" "timing"; do
             { ../venv/bin/python -m pytest benchmarks --collect-only -q -m "$tier" "${select[@]}" | grep '::' || true; } \
               | sed "s/\$/\t$tier/"
@@ -135,18 +177,18 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels
+          name: wheels-${{ matrix.side }}
           path: wheels/
 
   bench:
-    needs: prepare
+    needs: [prepare, build]
     name: "bench: ${{ matrix.name }}"
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+        include: ${{ fromJSON(needs.build.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -156,8 +198,9 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: wheels
+          pattern: wheels-*
           path: wheels
+          merge-multiple: true
 
       - name: Install SCIPOptSuite and Valgrind
         run: |
@@ -170,7 +213,7 @@ jobs:
 
       - name: Install base and PR
         run: |
-          for side in base pr; do
+          for side in base pr release; do
             python -m venv "venv-$side"
             "venv-$side/bin/pip" install -q -r pr/requirements/benchmark.txt "wheels/$side"/*.whl
           done
@@ -192,19 +235,21 @@ jobs:
             BENCH_MODE=$mode BENCH_LABEL="$mode/$side" BENCH_OUT="../results/$side-$INDEX.jsonl" \
               "$@" "../venv-$side/bin/python" -m pytest "$BENCH_ID" -q -p no:cacheprovider
           }
-          for side in base pr; do
-            run "$side" memory
-          done
-          if [ "$TIMING" = "true" ]; then
-            for side in base pr; do
-              run "$side" time
-            done
-          else
-            for side in base pr; do
+          measure() {
+            local side=$1
+            run "$side" memory || return 1
+            if [ "$TIMING" = "true" ]; then
+              run "$side" time || return 1
+            else
               mkdir -p "../callgrind-$side"
               BENCH_CALLGRIND_OUT="../callgrind-$side/out" run "$side" instructions \
-                setarch -R valgrind -q --tool=callgrind --instr-atstart=no --callgrind-out-file="../callgrind-$side/out"
-            done
+                setarch -R valgrind -q --tool=callgrind --instr-atstart=no --callgrind-out-file="../callgrind-$side/out" || return 1
+            fi
+          }
+          measure base
+          measure pr
+          if ! measure release; then
+            echo "::warning::$BENCH_ID does not run on the latest release; skipping it there"
           fi
 
       - uses: actions/upload-artifact@v4
@@ -226,6 +271,7 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           COMMENT_ID: ${{ needs.start.outputs.comment_id }}
+          REQUEST: ${{ needs.start.outputs.request }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         shell: python
         run: |
@@ -233,7 +279,9 @@ jobs:
           from datetime import datetime, timedelta, timezone
 
           INTERVAL = 300
-          repo, run_id, comment_id, run_url = (os.environ[k] for k in ("REPO", "RUN_ID", "COMMENT_ID", "RUN_URL"))
+          repo, run_id, comment_id, run_url, request = (
+              os.environ[k] for k in ("REPO", "RUN_ID", "COMMENT_ID", "RUN_URL", "REQUEST")
+          )
 
           def gh(*args):
               return subprocess.run(["gh", "api", *args], check=True, capture_output=True, text=True).stdout
@@ -247,9 +295,24 @@ jobs:
           def status():
               out = gh("--paginate", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100", "--jq", ".jobs[]")
               jobs = [json.loads(line) for line in out.splitlines()]
-              prepare = next((j for j in jobs if j["name"] == "prepare"), None)
+              setup = [j for j in jobs if j["name"] == "prepare" or j["name"].startswith("build: ")]
               bench = [j for j in jobs if j["name"].startswith("bench: ")]
-              return prepare, bench
+              return setup, bench
+
+          def current_step(job):
+              if job["status"] == "completed":
+                  return "done"
+              if job["status"] != "in_progress":
+                  return "waiting for a runner"
+              steps = [s for s in job.get("steps", []) if s["status"] == "in_progress"]
+              return f"at '{steps[0]['name']}'" if steps else "starting"
+
+          def setup_text(setup):
+              builds = [j for j in setup if j["name"].startswith("build: ")]
+              if not builds:
+                  return "resolving commits"
+              parts = [f"{j['name'].removeprefix('build: ')} {current_step(j)}" for j in builds]
+              return "installing SCIP and building wheels (" + ", ".join(parts) + "; usually 5–10 min)"
 
           def eta(bench, now):
               finished = [
@@ -266,30 +329,31 @@ jobs:
           start = datetime.now(timezone.utc)
           while True:
               time.sleep(INTERVAL)
-              prepare, bench = status()
-              if prepare and prepare["status"] == "completed" and prepare["conclusion"] != "success":
+              setup, bench = status()
+              if any(j["status"] == "completed" and j["conclusion"] != "success" for j in setup):
                   break
               if bench and all(j["status"] == "completed" for j in bench):
                   break
               now = datetime.now(timezone.utc)
               next_update = now + timedelta(seconds=INTERVAL)
               if not bench:
-                  text = "building base and PR"
+                  text = setup_text(setup)
               else:
                   done = sum(j["status"] == "completed" for j in bench)
-                  text = f"{done}/{len(bench)} benchmarks done"
+                  running = sum(j["status"] == "in_progress" for j in bench)
+                  text = f"{done}/{len(bench)} benchmarks done, {running} running"
                   remaining = eta(bench, now)
                   if remaining is not None:
                       text += f", about {minutes(remaining)} left"
               body = (
-                  f":hourglass_flowing_sand: Benchmark running for {minutes((now - start).total_seconds())}: {text}. "
+                  f":hourglass_flowing_sand: {request}: running for {minutes((now - start).total_seconds())}, {text}. "
                   f"Next update at {next_update:%H:%M} UTC. [Live run]({run_url})"
               )
               gh("-X", "PATCH", f"repos/{repo}/issues/comments/{comment_id}", "-f", f"body={body}")
 
   report:
-    needs: [prepare, bench]
-    if: always() && needs.prepare.result == 'success'
+    needs: [prepare, build, bench]
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -316,6 +380,15 @@ jobs:
           {
             python pr/benchmarks/compare.py --base results/base-*.jsonl --pr results/pr-*.jsonl
             echo
+            if compgen -G "results/release-*.jsonl" > /dev/null; then
+              echo "<details><summary>Compared with the latest release (${{ needs.prepare.outputs.release }})</summary>"
+              echo
+              python pr/benchmarks/compare.py --title "Latest release (${{ needs.prepare.outputs.release }}) → PR" \
+                --base results/release-*.jsonl --pr results/pr-*.jsonl
+              echo
+              echo "</details>"
+              echo
+            fi
             if [ "$BENCH_RESULT" != "success" ]; then
               echo ":warning: Some benchmark jobs did not succeed; their rows are missing or incomplete."
               echo
@@ -330,7 +403,7 @@ jobs:
           path: comment.md
 
   comment:
-    needs: [start, prepare, bench, report]
+    needs: [start, prepare, build, bench, report]
     if: always() && needs.start.outputs.comment_id != ''
     runs-on: ubuntu-latest
     permissions:
@@ -345,12 +418,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RESULT: ${{ needs.report.result }}
+          REQUEST: ${{ needs.start.outputs.request }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [ "$RESULT" = "success" ]; then
-            url=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" -F body=@comment.md --jq .html_url)
-            status=":white_check_mark: Benchmark finished. [Results]($url)"
+            { echo "Results for $REQUEST."; echo; cat comment.md; } > body.md
+            url=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" -F body=@body.md --jq .html_url)
+            status=":white_check_mark: $REQUEST: finished. [Results]($url)"
           else
-            status=":x: Benchmark did not finish. See the [run]($RUN_URL)."
+            status=":x: $REQUEST: did not finish. See the [run]($RUN_URL)."
           fi
           gh api -X PATCH "repos/${{ github.repository }}/issues/comments/${{ needs.start.outputs.comment_id }}" -f body="$status"
