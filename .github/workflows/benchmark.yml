@@ -6,6 +6,17 @@ env:
 on:
   issue_comment:
     types: [created]
+  push:
+    branches: [master]
+    paths:
+      - "src/**"
+      - "benchmarks/**"
+      - "requirements/benchmark.txt"
+      - "setup.py"
+      - "pyproject.toml"
+      - ".github/workflows/benchmark.yml"
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       filter:
@@ -19,6 +30,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'issue_comment' && format('benchmark-{0}', github.run_id) || format('benchmark-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name != 'issue_comment' }}
 
 jobs:
   start:
@@ -54,7 +69,7 @@ jobs:
 
   prepare:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      github.event_name != 'issue_comment' ||
       (github.event.issue.pull_request &&
        startsWith(github.event.comment.body, '/benchmark') &&
        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
@@ -64,9 +79,12 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
+      warm: ${{ steps.refs.outputs.warm }}
       head: ${{ steps.refs.outputs.head }}
       base: ${{ steps.refs.outputs.base }}
+      behind: ${{ steps.refs.outputs.behind }}
       release: ${{ steps.refs.outputs.release }}
+      builds: ${{ steps.refs.outputs.builds }}
       filter: ${{ steps.refs.outputs.filter }}
       timelimit: ${{ steps.refs.outputs.timelimit }}
       job_minutes: ${{ steps.refs.outputs.job_minutes }}
@@ -79,16 +97,27 @@ jobs:
           INPUT_FILTER: ${{ inputs.filter }}
           INPUT_TIMELIMIT: ${{ inputs.timelimit }}
         run: |
-          if [ "${{ github.event_name }}" = "issue_comment" ]; then
-            pr=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}")
-            head=$(jq -r .head.sha <<< "$pr")
-            base=$(jq -r .base.sha <<< "$pr")
-            args=$(printf '%s\n' "$COMMENT" | head -n1 | sed -E 's|^/benchmark[[:space:]]*||')
-          else
-            head=${{ github.sha }}
-            base=$(gh api "repos/${{ github.repository }}/commits/master" --jq .sha)
-            args="$INPUT_FILTER timelimit=${INPUT_TIMELIMIT:-600}"
-          fi
+          repo=${{ github.repository }}
+          warm=false
+          case "${{ github.event_name }}" in
+            issue_comment)
+              pr=$(gh api "repos/$repo/pulls/${{ github.event.issue.number }}")
+              head=$(jq -r .head.sha <<< "$pr")
+              base=$(gh api "repos/$repo/branches/$(jq -r .base.ref <<< "$pr")" --jq .commit.sha)
+              args=$(printf '%s\n' "$COMMENT" | head -n1 | sed -E 's|^/benchmark[[:space:]]*||')
+              ;;
+            workflow_dispatch)
+              head=${{ github.sha }}
+              base=$(gh api "repos/$repo/branches/${{ github.event.repository.default_branch }}" --jq .commit.sha)
+              args="$INPUT_FILTER timelimit=${INPUT_TIMELIMIT:-600}"
+              ;;
+            *)
+              warm=true
+              base=$(gh api "repos/$repo/branches/${{ github.event.repository.default_branch }}" --jq .commit.sha)
+              head=$base
+              args=""
+              ;;
+          esac
           timelimit=600
           filter=""
           for word in $args; do
@@ -107,10 +136,18 @@ jobs:
             echo "::error::The filter may only contain letters, digits, '_' and spaces"
             exit 1
           fi
+          release=$(gh api repos/scipopt/PySCIPOpt/releases/latest --jq .tag_name)
+          builds=$(jq -nc --arg repo "$repo" --arg base "$base" --arg head "$head" --arg release "$release" --argjson warm "$warm" '
+            [{side: "base", repository: $repo, ref: $base, list: $warm}]
+            + (if $warm then [] else [{side: "pr", repository: $repo, ref: $head, list: true}] end)
+            + [{side: "release", repository: "scipopt/PySCIPOpt", ref: $release, list: false}]')
           {
+            echo "warm=$warm"
             echo "head=$head"
             echo "base=$base"
-            echo "release=$(gh api repos/scipopt/PySCIPOpt/releases/latest --jq .tag_name)"
+            echo "behind=$(gh api "repos/$repo/compare/$base...$head" --jq .behind_by)"
+            echo "release=$release"
+            echo "builds=$builds"
             echo "filter=$filter"
             echo "timelimit=$timelimit"
             echo "job_minutes=$(( (3 * timelimit + 59) / 60 + 30 ))"
@@ -123,16 +160,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       matrix:
-        include:
-          - side: base
-            repository: ${{ github.repository }}
-            ref: ${{ needs.prepare.outputs.base }}
-          - side: pr
-            repository: ${{ github.repository }}
-            ref: ${{ needs.prepare.outputs.head }}
-          - side: release
-            repository: scipopt/PySCIPOpt
-            ref: ${{ needs.prepare.outputs.release }}
+        include: ${{ fromJSON(needs.prepare.outputs.builds) }}
     outputs:
       matrix: ${{ steps.list.outputs.matrix }}
     steps:
@@ -166,14 +194,33 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: python -m pip wheel --no-deps -w "wheels/${{ matrix.side }}" ./src
 
+      - uses: actions/checkout@v4
+        if: matrix.list && steps.cache.outputs.cache-hit == 'true'
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          path: src
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        if: matrix.list && steps.cache.outputs.cache-hit == 'true'
+        with:
+          python-version: "3.13"
+
+      - name: Install SCIP
+        if: matrix.list && steps.cache.outputs.cache-hit == 'true'
+        run: |
+          wget --quiet --no-check-certificate "https://github.com/scipopt/scip/releases/download/v${version}/scipoptsuite_${version}-1+jammy_amd64.deb"
+          sudo apt-get update && sudo apt install -y ./scipoptsuite_${version}-1+jammy_amd64.deb
+
       - name: List benchmarks
         id: list
-        if: matrix.side == 'pr'
+        if: matrix.list
         env:
           FILTER: ${{ needs.prepare.outputs.filter }}
         run: |
           python -m venv venv
-          venv/bin/pip install -q -r src/requirements/benchmark.txt wheels/pr/*.whl
+          venv/bin/pip install -q -r src/requirements/benchmark.txt wheels/${{ matrix.side }}/*.whl
           select=()
           [ -n "$FILTER" ] && select=(-k "$FILTER")
           cd src
@@ -228,11 +275,12 @@ jobs:
         id: install
         run: |
           for side in base pr release; do
+            [ -d "wheels/$side" ] || continue
             python -m venv "venv-$side"
             "venv-$side/bin/pip" install -q -r pr/requirements/benchmark.txt "wheels/$side"/*.whl
           done
           cc -O2 -shared -fPIC -o callgrind.so pr/benchmarks/callgrind.c
-          deps=$(venv-pr/bin/pip freeze | grep -iv '^pyscipopt' | sha256sum | cut -c1-16)
+          deps=$(venv-base/bin/pip freeze | grep -iv '^pyscipopt' | sha256sum | cut -c1-16)
           echo "cache_env=$ImageOS-$ImageVersion-scip$version-$deps-${{ hashFiles('pr/benchmarks/**') }}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@v4
@@ -251,6 +299,7 @@ jobs:
           TIMING: ${{ matrix.timing }}
           INDEX: ${{ strategy.job-index }}
           TIMELIMIT: ${{ needs.prepare.outputs.timelimit }}
+          WARM: ${{ needs.prepare.outputs.warm }}
           BENCH_CALLGRIND_LIB: ${{ github.workspace }}/callgrind.so
           PYTHONHASHSEED: "0"
         run: |
@@ -297,6 +346,7 @@ jobs:
             fi
             cat "$cached" >> "../results/$side-$INDEX.jsonl"
           done
+          [ "$WARM" = false ] || exit 0
 
           deterministic pr "../results/pr-$INDEX.jsonl" || exit 1
           if [ "$TIMING" = "true" ]; then
@@ -415,7 +465,7 @@ jobs:
 
   report:
     needs: [prepare, build, bench]
-    if: always() && needs.build.result == 'success'
+    if: always() && needs.build.result == 'success' && needs.prepare.outputs.warm == 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -438,6 +488,7 @@ jobs:
       - name: Compare
         env:
           BENCH_RESULT: ${{ needs.bench.result }}
+          BEHIND: ${{ needs.prepare.outputs.behind }}
           RELEASE: ${{ needs.prepare.outputs.release }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -453,6 +504,7 @@ jobs:
             fi
             echo
             [ "$BENCH_RESULT" = success ] || echo "Some benchmark jobs failed; see the run."
+            [ "$BEHIND" = 0 ] || echo "The PR is $BEHIND commits behind its base branch, so the comparison includes those commits. Merge or rebase first for a clean result."
             echo "Base \`${{ needs.prepare.outputs.base }}\`, PR \`${{ needs.prepare.outputs.head }}\`. [Run]($RUN_URL)"
           } > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
