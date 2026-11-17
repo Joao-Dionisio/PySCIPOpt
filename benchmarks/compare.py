@@ -54,7 +54,7 @@ def cell(b, p, kind, threshold):
     return f"{text} ({change:+.1%}){mark}", change > threshold
 
 
-def main(base_paths, pr_paths):
+def main(base_paths, pr_paths, title):
     base, pr = load(base_paths), load(pr_paths)
     rows, regressions = [], 0
     for name in sorted(base.keys() | pr.keys()):
@@ -65,7 +65,7 @@ def main(base_paths, pr_paths):
             regressions += worse
         rows.append(f"| `{name.split('::')[-1]}` | " + " | ".join(cells) + " |")
 
-    print("## Benchmark results (base → PR)\n")
+    print(f"## {title}\n")
     print(f":warning: {regressions} regression(s) flagged.\n" if regressions else "No regressions flagged.\n")
     print("| Benchmark | " + " | ".join(m[0] for m in METRICS) + " |")
     print("|---|" + "---|" * len(METRICS))
@@ -83,5 +83,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", nargs="+", required=True)
     parser.add_argument("--pr", nargs="+", required=True)
+    parser.add_argument("--title", default="Benchmark results (base → PR)")
     args = parser.parse_args()
-    main(args.base, args.pr)
+    main(args.base, args.pr, args.title)
