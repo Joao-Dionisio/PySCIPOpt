@@ -219,6 +219,22 @@ jobs:
           done
           cc -O2 -shared -fPIC -o callgrind.so pr/benchmarks/callgrind.c
 
+      - name: Result cache key
+        id: key
+        run: |
+          deps=$(venv-pr/bin/pip freeze | grep -iv '^pyscipopt' | sha256sum | cut -c1-16)
+          echo "env=$ImageOS-$ImageVersion-scip$version-$deps" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: cached/base
+          key: results-${{ needs.prepare.outputs.base }}-${{ steps.key.outputs.env }}-${{ hashFiles('pr/benchmarks/**') }}-${{ matrix.id }}
+
+      - uses: actions/cache@v4
+        with:
+          path: cached/release
+          key: results-${{ needs.prepare.outputs.release }}-${{ steps.key.outputs.env }}-${{ hashFiles('pr/benchmarks/**') }}-${{ matrix.id }}
+
       - name: Measure
         env:
           BENCH_ID: ${{ matrix.id }}
@@ -230,26 +246,44 @@ jobs:
           mkdir -p results
           cd pr
           run() {
-            local side=$1 mode=$2
-            shift 2
-            BENCH_MODE=$mode BENCH_LABEL="$mode/$side" BENCH_OUT="../results/$side-$INDEX.jsonl" \
+            local side=$1 mode=$2 out=$3
+            shift 3
+            BENCH_MODE=$mode BENCH_LABEL="$mode/$side" BENCH_OUT="$out" \
               "$@" "../venv-$side/bin/python" -m pytest "$BENCH_ID" -q -p no:cacheprovider
           }
-          measure() {
-            local side=$1
-            run "$side" memory || return 1
-            if [ "$TIMING" = "true" ]; then
-              run "$side" time || return 1
-            else
+          deterministic() {
+            local side=$1 out=$2
+            run "$side" memory "$out" || return 1
+            if [ "$TIMING" != "true" ]; then
               mkdir -p "../callgrind-$side"
-              BENCH_CALLGRIND_OUT="../callgrind-$side/out" run "$side" instructions \
+              BENCH_CALLGRIND_OUT="../callgrind-$side/out" run "$side" instructions "$out" \
                 setarch -R valgrind -q --tool=callgrind --instr-atstart=no --callgrind-out-file="../callgrind-$side/out" || return 1
             fi
           }
-          measure base
-          measure pr
-          if ! measure release; then
-            echo "::warning::$BENCH_ID does not run on the latest release; skipping it there"
+          release_ok=true
+          for side in base release; do
+            cached="../cached/$side/results.jsonl"
+            if [ -s "$cached" ]; then
+              echo "Using cached $side results"
+            elif deterministic "$side" "../$side.tmp"; then
+              mkdir -p "../cached/$side"
+              mv "../$side.tmp" "$cached"
+            elif [ "$side" = release ]; then
+              echo "::warning::$BENCH_ID does not run on the latest release; skipping it there"
+              release_ok=false
+              continue
+            else
+              exit 1
+            fi
+            cat "$cached" >> "../results/$side-$INDEX.jsonl"
+          done
+          deterministic pr "../results/pr-$INDEX.jsonl"
+          if [ "$TIMING" = "true" ]; then
+            run base time "../results/base-$INDEX.jsonl"
+            run pr time "../results/pr-$INDEX.jsonl"
+            if [ "$release_ok" = true ]; then
+              run release time "../results/release-$INDEX.jsonl"
+            fi
           fi
 
       - uses: actions/upload-artifact@v4
@@ -314,19 +348,44 @@ jobs:
               parts = [f"{j['name'].removeprefix('build: ')} {current_step(j)}" for j in builds]
               return "installing SCIP and building wheels (" + ", ".join(parts) + "; usually 5–10 min)"
 
-          def eta(bench, now):
-              finished = [
-                  (parse(j["completed_at"]) - parse(j["started_at"])).total_seconds()
-                  for j in bench if j["status"] == "completed"
-              ]
-              if not finished:
+          def durations(jobs):
+              return {
+                  j["name"]: (parse(j["completed_at"]) - parse(j["started_at"])).total_seconds()
+                  for j in jobs
+                  if j["name"].startswith("bench: ") and j["conclusion"] == "success"
+              }
+
+          def previous_durations():
+              runs = json.loads(gh(f"repos/{repo}/actions/runs/{run_id}", "--jq", "{workflow_id}"))
+              out = gh(
+                  f"repos/{repo}/actions/workflows/{runs['workflow_id']}/runs?status=success&per_page=5",
+                  "--jq", ".workflow_runs[].id",
+              )
+              for previous in out.split():
+                  jobs = gh("--paginate", f"repos/{repo}/actions/runs/{previous}/jobs?per_page=100", "--jq", ".jobs[]")
+                  known = durations(json.loads(line) for line in jobs.splitlines())
+                  if known:
+                      return known
+              return {}
+
+          def eta(bench, now, expected):
+              expected = {**expected, **durations(bench)}
+              if not expected:
                   return None
-              typical = sum(finished) / len(finished)
-              running = [(now - parse(j["started_at"])).total_seconds() for j in bench if j["status"] == "in_progress"]
-              queued = any(j["status"] in ("queued", "waiting", "pending") for j in bench)
-              return max([typical - r for r in running] + [0]) + (typical if queued else 0)
+              slowest = max(expected.values())
+              left = []
+              for j in bench:
+                  if j["status"] == "completed":
+                      continue
+                  total = expected.get(j["name"], slowest)
+                  if j["status"] == "in_progress":
+                      left.append(total - (now - parse(j["started_at"])).total_seconds())
+                  else:
+                      left.append(total)
+              return max(left, default=0)
 
           start = datetime.now(timezone.utc)
+          expected = previous_durations()
           while True:
               time.sleep(INTERVAL)
               setup, bench = status()
@@ -342,9 +401,13 @@ jobs:
                   done = sum(j["status"] == "completed" for j in bench)
                   running = sum(j["status"] == "in_progress" for j in bench)
                   text = f"{done}/{len(bench)} benchmarks done, {running} running"
-                  remaining = eta(bench, now)
-                  if remaining is not None:
+                  remaining = eta(bench, now, expected)
+                  if remaining is None:
+                      pass
+                  elif remaining > 30:
                       text += f", about {minutes(remaining)} left"
+                  else:
+                      text += ", finishing up"
               body = (
                   f":hourglass_flowing_sand: {request}: running for {minutes((now - start).total_seconds())}, {text}. "
                   f"Next update at {next_update:%H:%M} UTC. [Live run]({run_url})"
@@ -358,8 +421,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.head }}
-          path: pr
+          ref: ${{ github.event.repository.default_branch }}
+          path: tools
           persist-credentials: false
 
       - uses: actions/download-artifact@v4
@@ -378,12 +441,12 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           {
-            python pr/benchmarks/compare.py --base results/base-*.jsonl --pr results/pr-*.jsonl
+            python tools/benchmarks/compare.py --base results/base-*.jsonl --pr results/pr-*.jsonl
             echo
             if compgen -G "results/release-*.jsonl" > /dev/null; then
               echo "<details><summary>Compared with the latest release (${{ needs.prepare.outputs.release }})</summary>"
               echo
-              python pr/benchmarks/compare.py --title "Latest release (${{ needs.prepare.outputs.release }}) → PR" \
+              python tools/benchmarks/compare.py --title "Latest release (${{ needs.prepare.outputs.release }}) → PR" \
                 --base results/release-*.jsonl --pr results/pr-*.jsonl
               echo
               echo "</details>"
